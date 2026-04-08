@@ -13,7 +13,7 @@ export interface KubeMQOptionsFactory {
 export interface KubeMQModuleAsyncOptions {
   isGlobal?: boolean;
   imports?: Array<Type<unknown> | DynamicModule | Promise<DynamicModule> | ForwardReference>;
-  useFactory?: (...args: unknown[]) => KubeMQModuleOptions | Promise<KubeMQModuleOptions>;
+  useFactory?: (...args: any[]) => KubeMQModuleOptions | Promise<KubeMQModuleOptions>;
   useClass?: Type<KubeMQOptionsFactory>;
   useExisting?: Type<KubeMQOptionsFactory>;
   inject?: InjectionToken[];
@@ -30,7 +30,7 @@ export interface KubeMQClientOptionsFactory {
 export interface KubeMQRegisterAsyncOptions {
   name: string | symbol;
   imports?: Array<Type<unknown> | DynamicModule | Promise<DynamicModule> | ForwardReference>;
-  useFactory?: (...args: unknown[]) => KubeMQClientOptions | Promise<KubeMQClientOptions>;
+  useFactory?: (...args: any[]) => KubeMQClientOptions | Promise<KubeMQClientOptions>;
   useClass?: Type<KubeMQClientOptionsFactory>;
   useExisting?: Type<KubeMQClientOptionsFactory>;
   inject?: InjectionToken[];
