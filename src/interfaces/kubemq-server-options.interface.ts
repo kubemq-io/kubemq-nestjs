@@ -34,4 +34,6 @@ export interface KubeMQServerOptions {
   meterProvider?: unknown;
   verboseErrors?: boolean; // NEW (H-9) -- default false
   verboseHealth?: boolean; // NEW (M-13) -- default false
+  /** Enable/disable class-validator integration globally (default: true when validate is used on handlers). */
+  validation?: boolean;
 }

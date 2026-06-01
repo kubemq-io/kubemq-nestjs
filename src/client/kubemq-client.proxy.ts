@@ -3,13 +3,16 @@ import { Logger, OnApplicationShutdown } from '@nestjs/common';
 import { KubeMQClient as KubeMQSDKClient, ConnectionNotReadyError } from 'kubemq-js';
 import type { CommandResponse, QueryResponse, QueueSendResult, EventStoreResult } from 'kubemq-js';
 import type { KubeMQClientOptions } from '../interfaces/kubemq-client-options.interface.js';
-import { TAG_PATTERN, TAG_TYPE, TAG_CONTENT_TYPE } from '../constants.js';
+import { TAG_PATTERN, TAG_TYPE, TAG_CONTENT_TYPE, TAG_CORRELATION_ID, TAG_CAUSATION_ID } from '../constants.js';
 import { mapErrorToRpcException, mapToRpcException } from '../errors/error-mapper.js';
 import { isKubeMQRecord } from './kubemq-record.js';
 import { serializeBody, deserializeBody } from '../serialization/helpers.js';
 import { toError } from '../utils/error-helpers.js';
 import { createNestKubeMQLogger } from '../observability/logger-bridge.js';
 import { KubeMQStatus } from '../events/kubemq.events.js';
+import { CircuitBreaker } from '../circuit-breaker/circuit-breaker.js';
+import { CorrelationContext } from '../correlation/correlation-context.js';
+import { TracePropagator } from '../tracing/trace-propagator.js';
 
 function mergeWireTags(
   base: Record<string, string>,
@@ -30,6 +33,8 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
   protected readonly options: KubeMQClientOptions;
   private connectPromise: Promise<void> | null = null;
   private closing = false;
+  private circuitBreaker?: CircuitBreaker;
+  private readonly domainListeners = new Map<string, Set<(...args: any[]) => void>>();
 
   constructor(options: KubeMQClientOptions) {
     super();
@@ -122,10 +127,19 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
     this.client.on('stateChange', (state) => {
       this.logger.debug?.(`Connection state changed to: ${state}`);
     });
+
+    await TracePropagator.initialize(this.options.tracerProvider);
+
+    if (this.options.circuitBreaker) {
+      this.circuitBreaker = new CircuitBreaker(this.options.circuitBreaker, (state, failures) => {
+        this.emitDomainEvent('circuitBreaker', { state, failures });
+      });
+    }
   }
 
   async close(): Promise<void> {
     this.closing = true;
+    this.circuitBreaker?.destroy();
     if (this.connectPromise) {
       try {
         await this.connectPromise;
@@ -148,7 +162,35 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
     await this.close();
   }
 
+  on(event: string, listener: (...args: any[]) => void): this {
+    if (!this.domainListeners.has(event)) {
+      this.domainListeners.set(event, new Set());
+    }
+    this.domainListeners.get(event)!.add(listener);
+    return this;
+  }
+
+  private emitDomainEvent(event: string, payload: unknown): void {
+    const listeners = this.domainListeners.get(event);
+    if (listeners) {
+      for (const fn of listeners) fn(payload);
+    }
+  }
+
+  getCircuitBreakerState(): string | undefined {
+    return this.circuitBreaker?.getState();
+  }
+
   protected publish(packet: ReadPacket, callback: (packet: WritePacket) => void): () => void {
+    if (this.circuitBreaker) {
+      try {
+        this.circuitBreaker.guard();
+      } catch (err) {
+        callback({ err: err as Error, isDisposed: true });
+        return () => {};
+      }
+    }
+
     if (!this.client) {
       callback({
         err: new ConnectionNotReadyError({
@@ -173,6 +215,16 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
     };
     const tags = mergeWireTags(baseTags, userTags);
 
+    const corr = CorrelationContext.get();
+    if (corr) {
+      if (!tags[TAG_CORRELATION_ID]) tags[TAG_CORRELATION_ID] = corr.correlationId;
+      if (!tags[TAG_CAUSATION_ID]) tags[TAG_CAUSATION_ID] = corr.causationId;
+    }
+
+    TracePropagator.injectIntoTags(tags, this.options.tracerProvider);
+
+    const spanBytes = TracePropagator.serializeSpanContext(this.options.tracerProvider);
+
     const abortController = new AbortController();
 
     if (isQuery) {
@@ -190,10 +242,12 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
             tags,
             cacheKey,
             cacheTtlInSeconds: cacheTtl,
+            span: spanBytes,
           },
           { signal: abortController.signal },
         )
         .then((response: QueryResponse) => {
+          this.circuitBreaker?.recordSuccess();
           if (response.executed) {
             const responseData = response.body
               ? deserializeBody(response.body, response.tags, this.options.deserializer)
@@ -207,6 +261,7 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
           }
         })
         .catch((err: unknown) => {
+          this.circuitBreaker?.recordFailure();
           const e = toError(err);
           callback({
             err: mapErrorToRpcException(e, channel, this.verboseErrors),
@@ -224,10 +279,12 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
             body: serializedBody,
             timeoutInSeconds: timeout,
             tags,
+            span: spanBytes,
           },
           { signal: abortController.signal },
         )
         .then((response: CommandResponse) => {
+          this.circuitBreaker?.recordSuccess();
           if (response.executed) {
             const responseData = response.body
               ? deserializeBody(response.body, response.tags, this.options.deserializer)
@@ -241,6 +298,7 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
           }
         })
         .catch((err: unknown) => {
+          this.circuitBreaker?.recordFailure();
           const e = toError(err);
           callback({
             err: mapErrorToRpcException(e, channel, this.verboseErrors),
@@ -255,6 +313,10 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
   }
 
   protected async dispatchEvent(packet: ReadPacket): Promise<any> {
+    if (this.circuitBreaker) {
+      this.circuitBreaker.guard();
+    }
+
     if (!this.client) {
       throw new ConnectionNotReadyError({
         message: 'KubeMQ client is not connected. Call connect() first.',
@@ -272,53 +334,84 @@ export class KubeMQClientProxy extends ClientProxy implements OnApplicationShutd
       [TAG_CONTENT_TYPE]: this.options.serializer?.contentType ?? 'application/json',
     };
 
-    if (metadata?.type === 'queue') {
-      baseTags[TAG_TYPE] = 'queue';
-      const tags = mergeWireTags(baseTags, userTags);
-      const policy = (metadata?.policy ?? this.options.defaultQueuePolicy) as
-        | {
-            expirationSeconds?: number;
-            delaySeconds?: number;
-            maxReceiveCount?: number;
-            maxReceiveQueue?: string;
-          }
-        | undefined;
+    try {
+      if (metadata?.type === 'queue') {
+        baseTags[TAG_TYPE] = 'queue';
+        const tags = mergeWireTags(baseTags, userTags);
 
-      const result: QueueSendResult = await this.client.sendQueueMessage({
-        channel,
-        body: serializedBody,
-        tags,
-        policy: policy
-          ? {
-              expirationSeconds: policy.expirationSeconds,
-              delaySeconds: policy.delaySeconds,
-              maxReceiveCount: policy.maxReceiveCount,
-              maxReceiveQueue: policy.maxReceiveQueue,
+        const corr = CorrelationContext.get();
+        if (corr) {
+          if (!tags[TAG_CORRELATION_ID]) tags[TAG_CORRELATION_ID] = corr.correlationId;
+          if (!tags[TAG_CAUSATION_ID]) tags[TAG_CAUSATION_ID] = corr.causationId;
+        }
+        TracePropagator.injectIntoTags(tags, this.options.tracerProvider);
+
+        const policy = (metadata?.policy ?? this.options.defaultQueuePolicy) as
+          | {
+              expirationSeconds?: number;
+              delaySeconds?: number;
+              maxReceiveCount?: number;
+              maxReceiveQueue?: string;
             }
-          : undefined,
-      });
+          | undefined;
 
-      return result;
-    } else if (metadata?.type === 'event_store') {
-      baseTags[TAG_TYPE] = 'event_store';
-      const tags = mergeWireTags(baseTags, userTags);
+        const result: QueueSendResult = await this.client.sendQueueMessage({
+          channel,
+          body: serializedBody,
+          tags,
+          policy: policy
+            ? {
+                expirationSeconds: policy.expirationSeconds,
+                delaySeconds: policy.delaySeconds,
+                maxReceiveCount: policy.maxReceiveCount,
+                maxReceiveQueue: policy.maxReceiveQueue,
+              }
+            : undefined,
+        });
 
-      const result: EventStoreResult = await this.client.sendEventStore({
-        channel,
-        body: serializedBody,
-        tags,
-      });
+        this.circuitBreaker?.recordSuccess();
+        return result;
+      } else if (metadata?.type === 'event_store') {
+        baseTags[TAG_TYPE] = 'event_store';
+        const tags = mergeWireTags(baseTags, userTags);
 
-      return result;
-    } else {
-      baseTags[TAG_TYPE] = 'event';
-      const tags = mergeWireTags(baseTags, userTags);
+        const corr = CorrelationContext.get();
+        if (corr) {
+          if (!tags[TAG_CORRELATION_ID]) tags[TAG_CORRELATION_ID] = corr.correlationId;
+          if (!tags[TAG_CAUSATION_ID]) tags[TAG_CAUSATION_ID] = corr.causationId;
+        }
+        TracePropagator.injectIntoTags(tags, this.options.tracerProvider);
 
-      await this.client.sendEvent({
-        channel,
-        body: serializedBody,
-        tags,
-      });
+        const result: EventStoreResult = await this.client.sendEventStore({
+          channel,
+          body: serializedBody,
+          tags,
+        });
+
+        this.circuitBreaker?.recordSuccess();
+        return result;
+      } else {
+        baseTags[TAG_TYPE] = 'event';
+        const tags = mergeWireTags(baseTags, userTags);
+
+        const corr = CorrelationContext.get();
+        if (corr) {
+          if (!tags[TAG_CORRELATION_ID]) tags[TAG_CORRELATION_ID] = corr.correlationId;
+          if (!tags[TAG_CAUSATION_ID]) tags[TAG_CAUSATION_ID] = corr.causationId;
+        }
+        TracePropagator.injectIntoTags(tags, this.options.tracerProvider);
+
+        await this.client.sendEvent({
+          channel,
+          body: serializedBody,
+          tags,
+        });
+
+        this.circuitBreaker?.recordSuccess();
+      }
+    } catch (err) {
+      this.circuitBreaker?.recordFailure();
+      throw err;
     }
   }
 

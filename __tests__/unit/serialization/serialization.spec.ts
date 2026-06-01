@@ -167,6 +167,14 @@ describe('Serialization', () => {
     expect(() => serializer.serialize(BigInt(999))).toThrow(/Failed to serialize/);
   });
 
+  it('JsonDeserializer throws SerializationError on invalid UTF-8 bytes', () => {
+    const deserializer = new JsonDeserializer();
+    const invalidUtf8 = new Uint8Array([0xff, 0xfe, 0x80]);
+
+    expect(() => deserializer.deserialize(invalidUtf8)).toThrow(SerializationError);
+    expect(() => deserializer.deserialize(invalidUtf8)).toThrow(/Invalid UTF-8 body/);
+  });
+
   it('serializeBody error path throws SerializationError for circular object', () => {
     const circular: Record<string, unknown> = { a: 1 };
     circular.self = circular;

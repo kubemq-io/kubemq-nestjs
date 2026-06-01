@@ -159,6 +159,7 @@ vi.mock('kubemq-js', () => ({
 
 import { KubeMQClientProxy } from '../../../src/client/kubemq-client.proxy.js';
 import { KubeMQRecord } from '../../../src/client/kubemq-record.js';
+import { CorrelationContext } from '../../../src/correlation/correlation-context.js';
 
 describe('KubeMQClientProxy', () => {
   let proxy: KubeMQClientProxy;
@@ -617,5 +618,437 @@ describe('KubeMQClientProxy', () => {
       clientId: 'never-connected',
     });
     await expect(neverConnected.close()).resolves.toBeUndefined();
+  });
+
+  // --- Circuit breaker integration ---
+
+  describe('circuit breaker integration', () => {
+    it('publish when CB is open invokes callback with error', async () => {
+      const cbProxy = new KubeMQClientProxy({
+        address: 'localhost:50000',
+        clientId: 'cb-pub',
+        circuitBreaker: { failureThreshold: 1, resetTimeout: 60_000 },
+      });
+      await cbProxy.connect();
+      (cbProxy as any).circuitBreaker.recordFailure();
+
+      const cb = vi.fn();
+      (cbProxy as any).publish({ pattern: 'test', data: {} }, cb);
+
+      expect(cb).toHaveBeenCalledOnce();
+      expect(cb.mock.calls[0][0].err.name).toBe('CircuitBreakerOpenError');
+      expect(cb.mock.calls[0][0].isDisposed).toBe(true);
+      expect(mockClient.sendCommand).not.toHaveBeenCalled();
+
+      await cbProxy.close();
+    });
+
+    it('dispatchEvent when CB is open throws CircuitBreakerOpenError', async () => {
+      const cbProxy = new KubeMQClientProxy({
+        address: 'localhost:50000',
+        clientId: 'cb-dispatch',
+        circuitBreaker: { failureThreshold: 1, resetTimeout: 60_000 },
+      });
+      await cbProxy.connect();
+      (cbProxy as any).circuitBreaker.recordFailure();
+
+      await expect(
+        (cbProxy as any).dispatchEvent({ pattern: 'test', data: {} }),
+      ).rejects.toThrow('Circuit breaker');
+
+      await cbProxy.close();
+    });
+
+    it('publish records failure on CB after command rejection', async () => {
+      const cbProxy = new KubeMQClientProxy({
+        address: 'localhost:50000',
+        clientId: 'cb-fail',
+        circuitBreaker: { failureThreshold: 1, resetTimeout: 60_000 },
+      });
+      await cbProxy.connect();
+
+      mockClient.sendCommand.mockRejectedValueOnce(new Error('cmd fail'));
+
+      const cb = vi.fn();
+      (cbProxy as any).publish({ pattern: 'test', data: {} }, cb);
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      expect(cbProxy.getCircuitBreakerState()).toBe('open');
+
+      await cbProxy.close();
+    });
+
+    it('dispatchEvent records failure on CB when send throws', async () => {
+      const cbProxy = new KubeMQClientProxy({
+        address: 'localhost:50000',
+        clientId: 'cb-dispatch-fail',
+        circuitBreaker: { failureThreshold: 1, resetTimeout: 60_000 },
+      });
+      await cbProxy.connect();
+
+      mockClient.sendEvent.mockRejectedValueOnce(new Error('send err'));
+
+      await expect(
+        (cbProxy as any).dispatchEvent({ pattern: 'test', data: {} }),
+      ).rejects.toThrow('send err');
+
+      expect(cbProxy.getCircuitBreakerState()).toBe('open');
+
+      await cbProxy.close();
+    });
+
+    it('publish records success on CB after successful command', async () => {
+      const cbProxy = new KubeMQClientProxy({
+        address: 'localhost:50000',
+        clientId: 'cb-success',
+        circuitBreaker: { failureThreshold: 5, resetTimeout: 60_000 },
+      });
+      await cbProxy.connect();
+
+      mockClient.sendCommand.mockResolvedValueOnce({ executed: true, body: undefined });
+
+      const cb = vi.fn();
+      (cbProxy as any).publish({ pattern: 'test', data: {} }, cb);
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      expect(cbProxy.getCircuitBreakerState()).toBe('closed');
+
+      await cbProxy.close();
+    });
+
+    it('getCircuitBreakerState returns undefined without CB config', () => {
+      expect(proxy.getCircuitBreakerState()).toBeUndefined();
+    });
+
+    it('emits circuitBreaker domain event on state change', async () => {
+      const cbProxy = new KubeMQClientProxy({
+        address: 'localhost:50000',
+        clientId: 'cb-event',
+        circuitBreaker: { failureThreshold: 1, resetTimeout: 60_000 },
+      });
+
+      const listener = vi.fn();
+      cbProxy.on('circuitBreaker', listener);
+
+      await cbProxy.connect();
+      (cbProxy as any).circuitBreaker.recordFailure();
+
+      expect(listener).toHaveBeenCalledWith({ state: 'open', failures: 1 });
+
+      await cbProxy.close();
+    });
+  });
+
+  // --- Correlation context injection ---
+
+  describe('correlation context injection', () => {
+    it('publish injects correlation and causation tags', async () => {
+      await proxy.connect();
+      mockClient.sendCommand.mockResolvedValueOnce({ executed: true, body: undefined });
+
+      const cb = vi.fn();
+      CorrelationContext.run(
+        { correlationId: 'corr-123', causationId: 'cause-456' },
+        () => { (proxy as any).publish({ pattern: 'test', data: {} }, cb); },
+      );
+
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      expect(mockClient.sendCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tags: expect.objectContaining({
+            'x-correlation-id': 'corr-123',
+            'x-causation-id': 'cause-456',
+          }),
+        }),
+        expect.anything(),
+      );
+    });
+
+    it('dispatchEvent event injects correlation tags', async () => {
+      await proxy.connect();
+      mockClient.sendEvent.mockResolvedValueOnce(undefined);
+
+      await CorrelationContext.run(
+        { correlationId: 'corr-ev', causationId: 'cause-ev' },
+        async () => {
+          await (proxy as any).dispatchEvent({ pattern: 'test.ev', data: {} });
+        },
+      );
+
+      expect(mockClient.sendEvent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tags: expect.objectContaining({
+            'x-correlation-id': 'corr-ev',
+            'x-causation-id': 'cause-ev',
+          }),
+        }),
+      );
+    });
+
+    it('dispatchEvent queue injects correlation tags', async () => {
+      await proxy.connect();
+      mockClient.sendQueueMessage.mockResolvedValueOnce({ messageId: 'q-1', isError: false });
+
+      const record = new KubeMQRecord({}).asQueue();
+      await CorrelationContext.run(
+        { correlationId: 'corr-q', causationId: 'cause-q' },
+        async () => {
+          await (proxy as any).dispatchEvent({ pattern: 'test.q', data: record });
+        },
+      );
+
+      expect(mockClient.sendQueueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tags: expect.objectContaining({
+            'x-correlation-id': 'corr-q',
+            'x-causation-id': 'cause-q',
+          }),
+        }),
+      );
+    });
+
+    it('dispatchEvent event_store injects correlation tags', async () => {
+      await proxy.connect();
+      mockClient.sendEventStore.mockResolvedValueOnce({ sent: true });
+
+      const record = new KubeMQRecord({}).asEventStore();
+      await CorrelationContext.run(
+        { correlationId: 'corr-es', causationId: 'cause-es' },
+        async () => {
+          await (proxy as any).dispatchEvent({ pattern: 'test.es', data: record });
+        },
+      );
+
+      expect(mockClient.sendEventStore).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tags: expect.objectContaining({
+            'x-correlation-id': 'corr-es',
+            'x-causation-id': 'cause-es',
+          }),
+        }),
+      );
+    });
+
+    it('does not overwrite user-provided correlation ID', async () => {
+      await proxy.connect();
+      mockClient.sendCommand.mockResolvedValueOnce({ executed: true, body: undefined });
+
+      const record = new KubeMQRecord({}).withCorrelationId('user-corr');
+      const cb = vi.fn();
+      CorrelationContext.run(
+        { correlationId: 'ctx-corr', causationId: 'ctx-cause' },
+        () => { (proxy as any).publish({ pattern: 'test', data: record }, cb); },
+      );
+
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      const tags = mockClient.sendCommand.mock.calls[0][0].tags;
+      expect(tags['x-correlation-id']).toBe('user-corr');
+    });
+  });
+
+  // --- Query cache options ---
+
+  describe('publish query cache options', () => {
+    it('passes cacheKey and cacheTtl to sendQuery', async () => {
+      await proxy.connect();
+      mockClient.sendQuery.mockResolvedValueOnce({ executed: true, body: undefined });
+
+      const record = new KubeMQRecord({ id: '1' })
+        .asQuery()
+        .withMetadata({ cacheKey: 'orders:1', cacheTtl: 60, timeout: 20 });
+
+      const cb = vi.fn();
+      (proxy as any).publish({ pattern: 'orders.get', data: record }, cb);
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      expect(mockClient.sendQuery).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: 'orders.get',
+          cacheKey: 'orders:1',
+          cacheTtlInSeconds: 60,
+          timeoutInSeconds: 20,
+        }),
+        expect.anything(),
+      );
+    });
+  });
+
+  // --- Queue message policy ---
+
+  describe('dispatchEvent queue with policy', () => {
+    it('sends QueueMessagePolicy to sendQueueMessage', async () => {
+      await proxy.connect();
+      mockClient.sendQueueMessage.mockResolvedValueOnce({ messageId: 'q-2', isError: false });
+
+      const record = new KubeMQRecord({ task: 'process' })
+        .asQueue()
+        .withMetadata({
+          policy: {
+            expirationSeconds: 30,
+            delaySeconds: 5,
+            maxReceiveCount: 3,
+            maxReceiveQueue: 'dlq',
+          },
+        });
+
+      await (proxy as any).dispatchEvent({ pattern: 'q.process', data: record });
+
+      expect(mockClient.sendQueueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: 'q.process',
+          policy: {
+            expirationSeconds: 30,
+            delaySeconds: 5,
+            maxReceiveCount: 3,
+            maxReceiveQueue: 'dlq',
+          },
+        }),
+      );
+    });
+
+    it('sends queue without policy when not specified', async () => {
+      await proxy.connect();
+      mockClient.sendQueueMessage.mockResolvedValueOnce({ messageId: 'q-3', isError: false });
+
+      const record = new KubeMQRecord({ task: 'process' }).asQueue();
+      await (proxy as any).dispatchEvent({ pattern: 'q.no-policy', data: record });
+
+      expect(mockClient.sendQueueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel: 'q.no-policy',
+          policy: undefined,
+        }),
+      );
+    });
+  });
+
+  // --- mergeWireTags filtering ---
+
+  describe('mergeWireTags filtering', () => {
+    it('filters nestjs: prefixed user tags from wire message', async () => {
+      await proxy.connect();
+      mockClient.sendCommand.mockResolvedValueOnce({ executed: true, body: undefined });
+
+      const record = new KubeMQRecord({ id: '1' });
+      (record as any)._tags = { 'custom-key': 'value', 'nestjs:sneaky': 'should-be-filtered' };
+
+      const cb = vi.fn();
+      (proxy as any).publish({ pattern: 'test', data: record }, cb);
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      const sentTags = mockClient.sendCommand.mock.calls[0][0].tags;
+      expect(sentTags['custom-key']).toBe('value');
+      expect(sentTags).not.toHaveProperty('nestjs:sneaky');
+    });
+  });
+
+  // --- connect edge cases ---
+
+  describe('connect edge cases', () => {
+    it('returns immediately if already connected', async () => {
+      const { KubeMQClient } = await import('kubemq-js');
+      await proxy.connect();
+      await proxy.connect();
+
+      expect(KubeMQClient.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('concurrent connect() calls reuse the same promise', async () => {
+      const { KubeMQClient } = await import('kubemq-js');
+      const p1 = proxy.connect();
+      const p2 = proxy.connect();
+
+      await Promise.all([p1, p2]);
+
+      expect(KubeMQClient.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('connect while closing throws ConnectionNotReadyError', async () => {
+      await proxy.connect();
+      const closePromise = proxy.close();
+
+      try {
+        await proxy.connect();
+        expect.unreachable('should have thrown');
+      } catch (err: unknown) {
+        expect((err as any).name).toBe('ConnectionNotReadyError');
+      }
+
+      await closePromise;
+    });
+  });
+
+  // --- Command/query not-executed paths ---
+
+  describe('command/query not-executed paths', () => {
+    it('command not-executed invokes callback with HANDLER_ERROR', async () => {
+      await proxy.connect();
+      mockClient.sendCommand.mockResolvedValueOnce({
+        executed: false,
+        error: 'handler returned error',
+      });
+
+      const cb = vi.fn();
+      (proxy as any).publish({ pattern: 'orders.cmd', data: {} }, cb);
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      const errObj = cb.mock.calls[0][0].err.getError();
+      expect(errObj.kubemqCode).toBe('HANDLER_ERROR');
+      expect(errObj.statusCode).toBe(500);
+    });
+
+    it('query not-executed invokes callback with HANDLER_ERROR', async () => {
+      await proxy.connect();
+      mockClient.sendQuery.mockResolvedValueOnce({
+        executed: false,
+        error: 'query handler error',
+      });
+
+      const record = new KubeMQRecord({ id: '1' }).asQuery();
+      const cb = vi.fn();
+      (proxy as any).publish({ pattern: 'orders.q', data: record }, cb);
+      await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+      const errObj = cb.mock.calls[0][0].err.getError();
+      expect(errObj.kubemqCode).toBe('HANDLER_ERROR');
+      expect(errObj.statusCode).toBe(500);
+    });
+  });
+
+  // --- Additional publish/dispatch edge cases ---
+
+  it('non-string pattern is JSON-stringified', async () => {
+    await proxy.connect();
+    mockClient.sendCommand.mockResolvedValueOnce({ executed: true, body: undefined });
+
+    const cb = vi.fn();
+    (proxy as any).publish({ pattern: { cmd: 'create' }, data: {} }, cb);
+    await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+    expect(mockClient.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: '{"cmd":"create"}',
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('KubeMQRecord with metadata but no type sends as command', async () => {
+    await proxy.connect();
+    mockClient.sendCommand.mockResolvedValueOnce({ executed: true, body: undefined });
+
+    const record = new KubeMQRecord({ id: '1' }).withMetadata({ timeout: 30 });
+    const cb = vi.fn();
+    (proxy as any).publish({ pattern: 'test', data: record }, cb);
+    await vi.waitFor(() => { expect(cb).toHaveBeenCalled(); });
+
+    expect(mockClient.sendCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        timeoutInSeconds: 30,
+      }),
+      expect.anything(),
+    );
   });
 });

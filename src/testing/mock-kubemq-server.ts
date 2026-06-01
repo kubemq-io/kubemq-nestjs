@@ -75,10 +75,59 @@ export class MockKubeMQServer {
     return this.dispatchRequest(pattern, data, 'query');
   }
 
+  async dispatchCommandWithTags(
+    pattern: string,
+    data: unknown,
+    tags?: Record<string, string>,
+  ): Promise<{ executed: boolean; response?: unknown; error?: string }> {
+    return this.dispatchRequest(pattern, data, 'command', tags);
+  }
+
+  async dispatchEventWithTags(
+    pattern: string,
+    data: unknown,
+    tags?: Record<string, string>,
+  ): Promise<void> {
+    const handler = this.handlers.get(pattern);
+    if (!handler) throw new Error(`No handler registered for "${pattern}"`);
+    await handler(data, { tags: tags ?? {} });
+  }
+
+  async dispatchQueueMessageWithRetry(
+    pattern: string,
+    data: unknown,
+    receiveCount: number,
+  ): Promise<{ acked: boolean; dlqRouted?: boolean }> {
+    const handler = this.handlers.get(pattern);
+    if (!handler) throw new Error(`No handler registered for "${pattern}"`);
+    try {
+      await handler(data, { receiveCount });
+      return { acked: true };
+    } catch {
+      return { acked: false, dlqRouted: receiveCount >= 3 };
+    }
+  }
+
+  async dispatchQueueMessageWithIdempotencyKey(
+    pattern: string,
+    data: unknown,
+    idempotencyKey: string,
+  ): Promise<{ acked: boolean; deduplicated: boolean }> {
+    const handler = this.handlers.get(pattern);
+    if (!handler) throw new Error(`No handler registered for "${pattern}"`);
+    try {
+      await handler(data, { idempotencyKey });
+      return { acked: true, deduplicated: false };
+    } catch {
+      return { acked: false, deduplicated: false };
+    }
+  }
+
   private async dispatchRequest(
     pattern: string,
     data: unknown,
     patternType: 'command' | 'query',
+    tags?: Record<string, string>,
   ): Promise<{ executed: boolean; response?: unknown; error?: string }> {
     const handler = this.handlers.get(pattern);
     if (!handler) {
@@ -90,7 +139,7 @@ export class MockKubeMQServer {
           channel: pattern,
           id: randomUUID(),
           timestamp: new Date(),
-          tags: {},
+          tags: tags ?? {},
           metadata: '',
           patternType,
           fromClientId: 'mock-client',

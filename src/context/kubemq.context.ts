@@ -1,5 +1,6 @@
 import { BaseRpcContext } from '@nestjs/microservices';
 import type { KubeMQPatternType } from '../constants.js';
+import { TAG_CORRELATION_ID, TAG_CAUSATION_ID } from '../constants.js';
 
 export class KubeMQContext extends BaseRpcContext<[Record<string, any>]> {
   get channel(): string {
@@ -24,5 +25,13 @@ export class KubeMQContext extends BaseRpcContext<[Record<string, any>]> {
 
   get patternType(): KubeMQPatternType {
     return this.getArgByIndex(0).patternType as KubeMQPatternType;
+  }
+
+  getCorrelationId(): string | undefined {
+    return this.tags?.[TAG_CORRELATION_ID];
+  }
+
+  getCausationId(): string | undefined {
+    return this.tags?.[TAG_CAUSATION_ID];
   }
 }

@@ -15,7 +15,7 @@ export class HandlerExecutor {
     this.inflight.add(p);
     return p.finally(() => {
       this.inflight.delete(p);
-    }) as Promise<T>;
+    });
   }
 
   /**

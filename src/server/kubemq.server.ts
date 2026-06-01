@@ -26,13 +26,27 @@ import { KubeMQRequestContext } from '../context/kubemq-request.context.js';
 import { KubeMQEventStoreContext } from '../context/kubemq-event-store.context.js';
 import { KubeMQQueueContext } from '../context/kubemq-queue.context.js';
 import { KubeMQQueueBatchContext } from '../context/kubemq-queue-batch.context.js';
-import { TAG_PATTERN, TAG_ID, TAG_CONTENT_TYPE } from '../constants.js';
+import {
+  TAG_PATTERN,
+  TAG_ID,
+  TAG_CONTENT_TYPE,
+  TAG_CORRELATION_ID,
+  TAG_CAUSATION_ID,
+  TAG_IDEMPOTENCY_KEY,
+} from '../constants.js';
 import type { KubeMQPatternType } from '../constants.js';
 import type { KubeMQHandlerMetadata } from '../interfaces/handler-metadata.interface.js';
+import type { KubeMQServerEvents } from '../interfaces/kubemq-domain-events.interface.js';
 import { createNestKubeMQLogger } from '../observability/logger-bridge.js';
 import { serializeBody, deserializeBody } from '../serialization/helpers.js';
 import { toError, errorMessage, isConnectionError } from '../utils/error-helpers.js';
 import { KubeMQStatus } from '../events/kubemq.events.js';
+import { CorrelationContext } from '../correlation/correlation-context.js';
+import { TracePropagator, loadOtel } from '../tracing/trace-propagator.js';
+import { DlqHandler } from './dlq-handler.js';
+import { MessageValidator } from './message-validator.js';
+import { IdempotencyCache } from './idempotency-cache.js';
+import { BackpressureSemaphore } from './backpressure-semaphore.js';
 import { ReconnectManager } from './reconnect-manager.js';
 import { HandlerExecutor } from './handler-executor.js';
 
@@ -50,6 +64,12 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
   private readonly reconnect: ReconnectManager;
   private readonly executor = new HandlerExecutor();
   private readonly subscriptionErrors = new Map<string, string>();
+
+  private dlqHandler!: DlqHandler;
+  private readonly messageValidator = new MessageValidator();
+  private readonly idempotencyCaches = new Map<string, IdempotencyCache>();
+  private readonly semaphores = new Map<string, BackpressureSemaphore>();
+  private readonly domainListeners = new Map<string, Set<(...args: any[]) => void>>();
 
   constructor(options: KubeMQServerOptions) {
     super();
@@ -137,6 +157,13 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
 
     this.subscriptionErrors.clear();
 
+    for (const cache of this.idempotencyCaches.values()) {
+      cache.clear();
+    }
+    this.idempotencyCaches.clear();
+    this.semaphores.clear();
+    this.domainListeners.clear();
+
     this._status$.next(KubeMQStatus.CLOSED);
     this.logger.log('KubeMQ transport shut down');
   }
@@ -169,22 +196,39 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
   }
 
   /**
-   * Registers an event listener. If the client is not yet connected,
+   * Registers an event listener for both domain events (e.g. `deadLetter`)
+   * and kubemq-js client connection events. If the client is not yet connected,
    * the listener is queued and replayed once the client is available.
    */
   // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
-  on(event: string, callback: Function): void {
-    if (this.reconnect.isClosing) {
-      return;
+  on(event: string, callback: Function): this {
+    const cb = callback as (...args: any[]) => void;
+
+    if (!this.domainListeners.has(event)) {
+      this.domainListeners.set(event, new Set());
     }
-    if (this.client) {
-      (this.client as any).on(event, callback);
-    } else {
-      this.pendingEventListeners.push({
-        event,
-        callback: callback as (...args: any[]) => void,
-      });
+    this.domainListeners.get(event)!.add(cb);
+
+    if (!this.reconnect.isClosing) {
+      if (this.client) {
+        (this.client as any).on(event, cb);
+      } else {
+        this.pendingEventListeners.push({ event, callback: cb });
+      }
     }
+
+    return this;
+  }
+
+  private emitDomainEvent(event: string, payload: unknown): void {
+    const listeners = this.domainListeners.get(event);
+    if (listeners) {
+      for (const fn of listeners) fn(payload);
+    }
+  }
+
+  getDlqRoutedCount(): number {
+    return this.dlqHandler?.dlqRoutedCount ?? 0;
   }
 
   private async attemptReconnection(): Promise<void> {
@@ -220,6 +264,13 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
     }
 
     this.client = created;
+
+    await TracePropagator.initialize(this.options.tracerProvider);
+
+    this.dlqHandler = new DlqHandler(
+      () => this.client ?? null,
+      (event, payload) => { this.emitDomainEvent(event, payload); },
+    );
 
     this.setupConnectionListeners();
     this.replayPendingListeners();
@@ -270,6 +321,32 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
     metadata: KubeMQHandlerMetadata,
   ): Promise<void> {
     const type = this.resolvePatternType(handler, metadata);
+
+    if ((pattern.includes('*') || pattern.includes('>')) && type !== 'event') {
+      throw new ValidationError({
+        message: 'Wildcard subscriptions are only supported for @EventHandler (Events pattern)',
+        operation: 'bindHandler',
+      });
+    }
+
+    const effectiveConcurrency = metadata.concurrency ?? metadata.maxConcurrent;
+
+    if (type === 'queue' && effectiveConcurrency) {
+      this.semaphores.set(
+        pattern,
+        new BackpressureSemaphore(effectiveConcurrency, metadata.maxQueueDepth ?? 1000, pattern),
+      );
+    }
+
+    if (type === 'queue' && metadata.idempotency) {
+      this.idempotencyCaches.set(
+        pattern,
+        new IdempotencyCache(
+          metadata.idempotency.maxCacheSize ?? 10_000,
+          metadata.idempotency.ttlSeconds ?? 300,
+        ),
+      );
+    }
 
     switch (type) {
       case 'command':
@@ -329,7 +406,7 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
         group,
         onCommand: (cmd: CommandReceived) =>
           this.executor.track(() =>
-            this.handleRequestMessage(cmd, channel, 'command', handler, (resp) =>
+            this.handleRequestMessage(cmd, channel, 'command', handler, metadata, (resp) =>
               this.client!.sendCommandResponse(resp),
             ),
           ),
@@ -360,7 +437,7 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
         group,
         onQuery: (query: QueryReceived) =>
           this.executor.track(() =>
-            this.handleRequestMessage(query, channel, 'query', handler, (resp) =>
+            this.handleRequestMessage(query, channel, 'query', handler, metadata, (resp) =>
               this.client!.sendQueryResponse(resp),
             ),
           ),
@@ -382,6 +459,7 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
     channel: string,
     patternType: 'command' | 'query',
     handler: MessageHandler,
+    metadata: KubeMQHandlerMetadata,
     sendResponse: (resp: {
       id: string;
       replyChannel: string;
@@ -394,27 +472,36 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
   ): Promise<void> {
     try {
       const data = deserializeBody(msg.body, msg.tags, this.options.deserializer);
-      const ctx = new KubeMQRequestContext([
-        {
-          channel: msg.channel,
-          id: msg.id,
-          timestamp: msg.timestamp,
-          tags: msg.tags,
-          metadata: msg.metadata,
-          patternType: patternType as KubeMQPatternType,
-          fromClientId: msg.fromClientId,
-          replyChannel: msg.replyChannel,
-        },
-      ]);
-
-      const result$ = this.transformToObservable(await handler(data, ctx));
 
       let response: unknown;
       let error: string | undefined;
       try {
-        response = await this.executor.executeRpc(
-          result$,
-          this.getHandlerTimeoutMs(patternType),
+        response = await this.executeWithMiddleware(
+          channel,
+          handler,
+          metadata,
+          data,
+          msg.body,
+          msg.id,
+          msg.tags ?? {},
+          patternType,
+          () =>
+            new KubeMQRequestContext([
+              {
+                channel: msg.channel,
+                id: msg.id,
+                timestamp: msg.timestamp,
+                tags: msg.tags,
+                metadata: msg.metadata,
+                patternType: patternType as KubeMQPatternType,
+                fromClientId: msg.fromClientId,
+                replyChannel: msg.replyChannel,
+              },
+            ]),
+          async (h, d, ctx) => {
+            const result$ = this.transformToObservable(await h(d, ctx));
+            return this.executor.executeRpc(result$, this.getHandlerTimeoutMs(patternType));
+          },
         );
       } catch (err) {
         const normalized = toError(err);
@@ -490,22 +577,35 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
             try {
               const data = deserializeBody(event.body, event.tags, this.options.deserializer);
 
-              const ctx = new KubeMQContext([
-                {
-                  channel: event.channel,
-                  id: event.id,
-                  timestamp: event.timestamp,
-                  tags: event.tags,
-                  metadata: event.metadata,
-                  patternType: 'event' as KubeMQPatternType,
+              await this.executeWithMiddleware(
+                channel,
+                handler,
+                metadata,
+                data,
+                event.body,
+                event.id,
+                event.tags ?? {},
+                'event',
+                () =>
+                  new KubeMQContext([
+                    {
+                      channel: event.channel,
+                      id: event.id,
+                      timestamp: event.timestamp,
+                      tags: event.tags,
+                      metadata: event.metadata,
+                      patternType: 'event' as KubeMQPatternType,
+                    },
+                  ]),
+                async (h, d, ctx) => {
+                  const result$ = this.transformToObservable(await h(d, ctx));
+                  await this.executor.executeWithDefault(
+                    result$,
+                    this.getHandlerTimeoutMs('command'),
+                  );
                 },
-              ]);
-
-              const result$ = this.transformToObservable(await handler(data, ctx));
-              await this.executor.executeWithDefault(
-                result$,
-                this.getHandlerTimeoutMs('command'),
               );
+
               this.subscriptionErrors.delete(channel);
             } catch (err) {
               this.logger.error(`Error handling event on ${channel}: ${errorMessage(err)}`);
@@ -546,23 +646,36 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
             try {
               const data = deserializeBody(event.body, event.tags, this.options.deserializer);
 
-              const ctx = new KubeMQEventStoreContext([
-                {
-                  channel: event.channel,
-                  id: event.id,
-                  timestamp: event.timestamp,
-                  tags: event.tags,
-                  metadata: event.metadata,
-                  patternType: 'event_store' as KubeMQPatternType,
-                  sequence: event.sequence,
+              await this.executeWithMiddleware(
+                channel,
+                handler,
+                metadata,
+                data,
+                event.body,
+                event.id,
+                event.tags ?? {},
+                'event_store',
+                () =>
+                  new KubeMQEventStoreContext([
+                    {
+                      channel: event.channel,
+                      id: event.id,
+                      timestamp: event.timestamp,
+                      tags: event.tags,
+                      metadata: event.metadata,
+                      patternType: 'event_store' as KubeMQPatternType,
+                      sequence: event.sequence,
+                    },
+                  ]),
+                async (h, d, ctx) => {
+                  const result$ = this.transformToObservable(await h(d, ctx));
+                  await this.executor.executeWithDefault(
+                    result$,
+                    this.getHandlerTimeoutMs('command'),
+                  );
                 },
-              ]);
-
-              const result$ = this.transformToObservable(await handler(data, ctx));
-              await this.executor.executeWithDefault(
-                result$,
-                this.getHandlerTimeoutMs('command'),
               );
+
               this.subscriptionErrors.delete(channel);
             } catch (err) {
               this.logger.error(`Error handling event-store on ${channel}: ${errorMessage(err)}`);
@@ -627,9 +740,9 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
 
     streamHandle.onMessages(async (messages: QueueStreamMessage[]) => {
       if (batchMode) {
-        await this.handleQueueBatch(channel, messages, handler, manualAck);
+        await this.handleQueueBatch(channel, messages, handler, manualAck, metadata);
       } else {
-        await this.handleQueueSingle(channel, messages, handler, manualAck);
+        await this.handleQueueSingle(channel, messages, handler, manualAck, metadata);
       }
     });
 
@@ -650,30 +763,50 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
     messages: QueueStreamMessage[],
     handler: MessageHandler,
     manualAck: boolean,
+    metadata: KubeMQHandlerMetadata,
   ): Promise<void> {
     for (const msg of messages) {
       await this.executor.track(async () => {
+        const sem = this.semaphores.get(channel);
+        if (sem) await sem.acquire(true);
         try {
           const data = deserializeBody(msg.body, msg.tags, this.options.deserializer);
 
-          const ctx = new KubeMQQueueContext([
-            {
-              channel: msg.channel,
-              id: msg.id,
-              timestamp: msg.timestamp,
-              tags: msg.tags,
-              metadata: msg.metadata,
-              patternType: 'queue' as KubeMQPatternType,
-              sequence: msg.sequence,
-              receiveCount: msg.receiveCount,
-              isReRouted: msg.isReRouted,
-              reRouteFromQueue: msg.reRouteFromQueue,
-              _rawMessage: manualAck ? msg : null,
+          await this.executeWithMiddleware(
+            channel,
+            handler,
+            metadata,
+            data,
+            msg.body,
+            msg.id,
+            msg.tags ?? {},
+            'queue',
+            () =>
+              new KubeMQQueueContext([
+                {
+                  channel: msg.channel,
+                  id: msg.id,
+                  timestamp: msg.timestamp,
+                  tags: msg.tags,
+                  metadata: msg.metadata,
+                  patternType: 'queue' as KubeMQPatternType,
+                  sequence: msg.sequence,
+                  receiveCount: msg.receiveCount,
+                  isReRouted: msg.isReRouted,
+                  reRouteFromQueue: msg.reRouteFromQueue,
+                  _rawMessage: manualAck ? msg : null,
+                },
+              ]),
+            async (h, d, ctx) => {
+              const result$ = this.transformToObservable(await h(d, ctx));
+              await this.executor.executeWithDefault(result$, this.getHandlerTimeoutMs('command'));
             },
-          ]);
-
-          const result$ = this.transformToObservable(await handler(data, ctx));
-          await this.executor.executeWithDefault(result$, this.getHandlerTimeoutMs('command'));
+            {
+              reRouted: msg.isReRouted,
+              receiveCount: msg.receiveCount,
+              reRoutedFromQueue: msg.reRouteFromQueue,
+            },
+          );
 
           this.subscriptionErrors.delete(channel);
 
@@ -685,6 +818,8 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
           if (!manualAck) {
             msg.nack();
           }
+        } finally {
+          if (sem) sem.release();
         }
       });
     }
@@ -695,8 +830,11 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
     messages: QueueStreamMessage[],
     handler: MessageHandler,
     manualAck: boolean,
+    metadata: KubeMQHandlerMetadata,
   ): Promise<void> {
     await this.executor.track(async () => {
+      const sem = this.semaphores.get(channel);
+      if (sem) await sem.acquire(true);
       try {
         const contexts: KubeMQQueueContext[] = [];
         const payloads: unknown[] = [];
@@ -722,9 +860,29 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
           );
         }
 
+        const firstMsg = messages[0]!;
         const batchCtx = new KubeMQQueueBatchContext(contexts, messages, manualAck);
-        const result$ = this.transformToObservable(await handler(payloads, batchCtx));
-        await this.executor.executeWithDefault(result$, this.getHandlerTimeoutMs('command'));
+
+        await this.executeWithMiddleware(
+          channel,
+          handler,
+          metadata,
+          payloads,
+          firstMsg.body,
+          firstMsg.id,
+          firstMsg.tags ?? {},
+          'queue',
+          () => batchCtx,
+          async (h, d, ctx) => {
+            const result$ = this.transformToObservable(await h(d, ctx));
+            await this.executor.executeWithDefault(result$, this.getHandlerTimeoutMs('command'));
+          },
+          {
+            reRouted: firstMsg.isReRouted,
+            receiveCount: firstMsg.receiveCount,
+            reRoutedFromQueue: firstMsg.reRouteFromQueue,
+          },
+        );
 
         this.subscriptionErrors.delete(channel);
 
@@ -740,6 +898,8 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
             msg.nack();
           }
         }
+      } finally {
+        if (sem) sem.release();
       }
     });
   }
@@ -782,6 +942,156 @@ export class KubeMQServer extends Server implements CustomTransportStrategy {
 
   private parseHandlerMetadata(extras?: Record<string, unknown>): KubeMQHandlerMetadata {
     return (extras ?? {}) as KubeMQHandlerMetadata;
+  }
+
+  private resolveMaxRetries(metadata: KubeMQHandlerMetadata): number {
+    if (metadata.maxRetries !== undefined) return metadata.maxRetries;
+    return metadata.deadLetterChannel ? 3 : 0;
+  }
+
+  private async executeWithMiddleware(
+    pattern: string,
+    handler: MessageHandler,
+    metadata: KubeMQHandlerMetadata,
+    data: unknown,
+    rawBody: Uint8Array,
+    messageId: string,
+    tags: Record<string, string>,
+    patternType: string,
+    createContext: (data: unknown) => any,
+    execute: (handler: MessageHandler, data: unknown, ctx: any) => Promise<unknown>,
+    queueMessageAttributes?: {
+      reRouted?: boolean;
+      receiveCount?: number;
+      reRoutedFromQueue?: string;
+    },
+  ): Promise<unknown> {
+    if (patternType === 'queue') {
+      const cache = this.idempotencyCaches.get(pattern);
+      if (cache) {
+        const key = tags[TAG_IDEMPOTENCY_KEY];
+        if (key && cache.has(key)) {
+          this.logger.debug(
+            `Duplicate message on "${pattern}" with idempotency key "${key}"`,
+          );
+          return undefined;
+        }
+      }
+    }
+
+    if (metadata.validate && this.options.validation !== false) {
+      const result = await this.messageValidator.validate(data, metadata.validate, pattern);
+      if (!result.valid) {
+        const err = result.error!;
+        if (patternType === 'command' || patternType === 'query') {
+          throw err;
+        }
+        if (metadata.deadLetterChannel) {
+          await this.dlqHandler.routeToDlq({
+            sourceChannel: pattern,
+            dlqChannel: metadata.deadLetterChannel,
+            patternType,
+            messageId,
+            body: rawBody,
+            retryCount: 0,
+            error: err,
+          });
+        } else {
+          this.logger.warn(err.message);
+        }
+        return undefined;
+      }
+    }
+
+    const corrStore = CorrelationContext.createFromTags(
+      tags,
+      messageId,
+      TAG_CORRELATION_ID,
+      TAG_CAUSATION_ID,
+    );
+
+    const extractedTraceCtx = TracePropagator.extractContext(tags, this.options.tracerProvider);
+
+    const executeInContext = async (): Promise<unknown> => {
+      const dlqChannel = metadata.deadLetterChannel;
+
+      if (patternType === 'queue') {
+        if (queueMessageAttributes?.reRouted && dlqChannel) {
+          this.logger.warn(
+            `Message "${messageId}" on "${pattern}" was rerouted to DLQ "${dlqChannel}" by the broker (ReRouted=true).`,
+          );
+          this.emitDomainEvent('deadLetter', {
+            channel: pattern,
+            dlqChannel,
+            messageId,
+            error: '(broker-routed to DLQ)',
+            retryCount: queueMessageAttributes.receiveCount ?? 0,
+          } satisfies KubeMQServerEvents['deadLetter']);
+        }
+
+        try {
+          const ctx = createContext(data);
+          const result = await execute(handler, data, ctx);
+
+          const cache = this.idempotencyCaches.get(pattern);
+          const key = tags[TAG_IDEMPOTENCY_KEY];
+          if (cache && key) cache.add(key);
+
+          return result;
+        } catch (err) {
+          const error = err instanceof Error ? err : new Error(String(err));
+          if (dlqChannel) {
+            this.logger.debug(
+              `Queue handler "${pattern}" failed — broker manages redelivery/DLQ via QueueMessagePolicy.`,
+            );
+          }
+          throw error;
+        }
+      }
+
+      const maxRetries = this.resolveMaxRetries(metadata);
+      let lastError: Error | undefined;
+
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const ctx = createContext(data);
+          const result = await execute(handler, data, ctx);
+          return result;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          if (attempt < maxRetries) {
+            this.logger.debug(
+              `Handler "${pattern}" failed (attempt ${attempt + 1}/${maxRetries + 1}): ${lastError.message}`,
+            );
+          }
+        }
+      }
+
+      if (dlqChannel && lastError) {
+        await this.dlqHandler.routeToDlq({
+          sourceChannel: pattern,
+          dlqChannel,
+          patternType,
+          messageId,
+          body: rawBody,
+          retryCount: maxRetries,
+          error: lastError,
+        });
+      }
+
+      if (lastError) throw lastError;
+      return undefined;
+    };
+
+    return CorrelationContext.run(corrStore, async () => {
+      if (extractedTraceCtx) {
+        const api = loadOtel();
+        if (api) {
+          return api.context.with(extractedTraceCtx as any, executeInContext);
+        }
+      }
+      return executeInContext();
+    });
   }
 
   private getHandlerTimeoutMs(patternType: 'command' | 'query'): number {

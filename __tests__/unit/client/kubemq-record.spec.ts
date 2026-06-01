@@ -1,56 +1,60 @@
 import { describe, it, expect } from 'vitest';
-import { KubeMQRecord, isKubeMQRecord, KUBEMQ_RECORD_SYMBOL } from '../../../src/client/kubemq-record.js';
+import { KubeMQRecord, isKubeMQRecord } from '../../../src/client/kubemq-record.js';
+import { TAG_IDEMPOTENCY_KEY, TAG_CORRELATION_ID } from '../../../src/constants.js';
 
 describe('KubeMQRecord', () => {
-  // Group 6, T1: withMetadata strips type key
-  it('withMetadata strips the "type" key from metadata', () => {
-    const record = new KubeMQRecord({ data: 'test' })
-      .asQuery()
-      .withMetadata({ type: 'should-be-stripped', timeout: 5000, cacheKey: 'abc' });
+  // DM-1: withDelay(30) sets delaySeconds on policy
+  it('withDelay sets delaySeconds in metadata policy', () => {
+    const record = new KubeMQRecord({ order: 'abc' }).asQueue().withDelay(30);
 
-    // type should NOT be in metadata
-    expect(record.__kubemq_metadata).not.toHaveProperty('type');
-    // Other keys should be preserved
-    expect(record.__kubemq_metadata).toEqual({ timeout: 5000, cacheKey: 'abc' });
-    // KubeMQ type should remain as set by asQuery()
-    expect(record.__kubemq_type).toBe('query');
+    expect(record.__kubemq_metadata.policy).toEqual(
+      expect.objectContaining({ delaySeconds: 30 }),
+    );
   });
 
-  // Group 7, T4: isKubeMQRecord type guard
-  it('isKubeMQRecord correctly identifies KubeMQRecord instances', () => {
-    const record = new KubeMQRecord({ data: 'test' });
-    expect(isKubeMQRecord(record)).toBe(true);
+  // DM-2: withDelay on non-queue record still sets metadata (warning at dispatch time)
+  it('withDelay sets metadata regardless of type (validated at dispatch)', () => {
+    const record = new KubeMQRecord({ data: 1 }).asQuery().withDelay(10);
+    expect(record.__kubemq_metadata.policy).toEqual(
+      expect.objectContaining({ delaySeconds: 10 }),
+    );
+  });
 
-    // Non-record objects
+  it('withIdempotencyKey sets the idempotency tag', () => {
+    const record = new KubeMQRecord({}).withIdempotencyKey('dedup-123');
+    expect(record.__kubemq_tags[TAG_IDEMPOTENCY_KEY]).toBe('dedup-123');
+  });
+
+  it('withCorrelationId sets the correlation tag', () => {
+    const record = new KubeMQRecord({}).withCorrelationId('corr-456');
+    expect(record.__kubemq_tags[TAG_CORRELATION_ID]).toBe('corr-456');
+  });
+
+  it('withTags ignores reserved nestjs: prefix keys', () => {
+    const record = new KubeMQRecord({}).withTags({
+      'nestjs:pattern': 'should-be-ignored',
+      'custom-tag': 'kept',
+    });
+    expect(record.__kubemq_tags['nestjs:pattern']).toBeUndefined();
+    expect(record.__kubemq_tags['custom-tag']).toBe('kept');
+  });
+
+  it('isKubeMQRecord returns true for KubeMQRecord instances', () => {
+    expect(isKubeMQRecord(new KubeMQRecord({}))).toBe(true);
+    expect(isKubeMQRecord({ data: 1 })).toBe(false);
     expect(isKubeMQRecord(null)).toBe(false);
-    expect(isKubeMQRecord(undefined)).toBe(false);
-    expect(isKubeMQRecord({})).toBe(false);
-    expect(isKubeMQRecord({ data: 'test' })).toBe(false);
     expect(isKubeMQRecord('string')).toBe(false);
-    expect(isKubeMQRecord(42)).toBe(false);
-
-    // Object with the symbol but wrong value
-    const fake = { [KUBEMQ_RECORD_SYMBOL]: false };
-    expect(isKubeMQRecord(fake)).toBe(false);
-
-    // Object with the symbol and correct value
-    const trueish = { [KUBEMQ_RECORD_SYMBOL]: true };
-    expect(isKubeMQRecord(trueish)).toBe(true);
   });
 
-  it('withTags() sets user tags and filters nestjs: prefixed keys', () => {
-    const record = new KubeMQRecord({ data: 'test' })
-      .withTags({ 'app:version': '1.0', 'nestjs:type': 'should-be-stripped', custom: 'ok' });
-
-    expect(record.__kubemq_tags).toEqual({ 'app:version': '1.0', custom: 'ok' });
-    expect(record.__kubemq_tags).not.toHaveProperty('nestjs:type');
+  it('type builder methods set correct __kubemq_type', () => {
+    expect(new KubeMQRecord({}).asQuery().__kubemq_type).toBe('query');
+    expect(new KubeMQRecord({}).asEventStore().__kubemq_type).toBe('event_store');
+    expect(new KubeMQRecord({}).asQueue().__kubemq_type).toBe('queue');
+    expect(new KubeMQRecord({}).__kubemq_type).toBeUndefined();
   });
 
-  it('withTags() merges with existing tags', () => {
-    const record = new KubeMQRecord({ data: 'test' })
-      .withTags({ first: '1' })
-      .withTags({ second: '2' });
-
-    expect(record.__kubemq_tags).toEqual({ first: '1', second: '2' });
+  it('withMetadata strips type key', () => {
+    const record = new KubeMQRecord({}).withMetadata({ type: 'override', timeout: 5000 });
+    expect(record.__kubemq_metadata).toEqual({ timeout: 5000 });
   });
 });

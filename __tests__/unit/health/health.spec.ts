@@ -80,4 +80,109 @@ describe('KubeMQHealthIndicator', () => {
       'orders-queue': 'stream broken: connection lost',
     });
   });
+
+  it('fromServer() creates indicator from server.unwrap() and getSubscriptionErrors()', () => {
+    const subErrors = new Map<string, string>();
+    const mockServer = {
+      unwrap: vi.fn().mockReturnValue(mockClient),
+      getSubscriptionErrors: vi.fn().mockReturnValue(subErrors),
+    };
+
+    const ind = KubeMQHealthIndicator.fromServer(mockServer as any);
+
+    expect(mockServer.unwrap).toHaveBeenCalledOnce();
+    expect(mockServer.getSubscriptionErrors).toHaveBeenCalledOnce();
+    expect(ind).toBeInstanceOf(KubeMQHealthIndicator);
+  });
+
+  it('fromServer(server, verbose=true) creates a verbose indicator', async () => {
+    const mockServer = {
+      unwrap: vi.fn().mockReturnValue(mockClient),
+      getSubscriptionErrors: vi.fn().mockReturnValue(new Map()),
+    };
+
+    const ind = KubeMQHealthIndicator.fromServer(mockServer as any, true);
+    const result = await ind.isHealthy('kubemq');
+
+    expect(result.kubemq.status).toBe('up');
+    expect(result.kubemq.host).toBe('localhost:50000');
+    expect(result.kubemq.version).toBe('3.0.0');
+  });
+
+  it('verbose=true includes host, version, serverStartTime, serverUpTime', async () => {
+    const ind = new KubeMQHealthIndicator(mockClient as any, new Map(), true);
+    const result = await ind.isHealthy('svc');
+
+    expect(result.svc.status).toBe('up');
+    expect(result.svc.host).toBe('localhost:50000');
+    expect(result.svc.version).toBe('3.0.0');
+    expect(result.svc.serverStartTime).toBe(1700000000);
+    expect(result.svc.serverUpTime).toBe(86400);
+  });
+
+  it('ping failure returns status down', async () => {
+    mockClient.ping.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+    const result = await indicator.isHealthy('kubemq');
+
+    expect(result.kubemq).toEqual({ status: 'down' });
+  });
+
+  it('setCircuitBreakerStateGetter includes circuitBreakerState in healthy result', async () => {
+    indicator.setVerbose(true);
+    indicator.setCircuitBreakerStateGetter(() => 'closed');
+
+    const result = await indicator.isHealthy('kubemq');
+
+    expect(result.kubemq.status).toBe('up');
+    expect(result.kubemq.circuitBreakerState).toBe('closed');
+  });
+
+  it('setDlqRoutedCountGetter includes dlqRoutedCount in healthy result', async () => {
+    indicator.setVerbose(true);
+    indicator.setDlqRoutedCountGetter(() => 42);
+
+    const result = await indicator.isHealthy('kubemq');
+
+    expect(result.kubemq.status).toBe('up');
+    expect(result.kubemq.dlqRoutedCount).toBe(42);
+  });
+
+  it('degraded + circuitBreakerState + dlqRoutedCount', async () => {
+    const subErrors = new Map([['q1', 'broken']]);
+    indicator.setSubscriptionErrors(subErrors);
+    indicator.setCircuitBreakerStateGetter(() => 'open');
+    indicator.setDlqRoutedCountGetter(() => 5);
+
+    const result = await indicator.isHealthy('kubemq');
+
+    expect(result.kubemq.status).toBe('degraded');
+    expect(result.kubemq.circuitBreakerState).toBe('open');
+    expect(result.kubemq.dlqRoutedCount).toBe(5);
+    expect(result.kubemq).not.toHaveProperty('streamErrors');
+  });
+
+  it('degraded + verbose includes streamErrors, circuitBreakerState, dlqRoutedCount', async () => {
+    const subErrors = new Map([['q1', 'broken']]);
+    indicator.setSubscriptionErrors(subErrors);
+    indicator.setVerbose(true);
+    indicator.setCircuitBreakerStateGetter(() => 'half-open');
+    indicator.setDlqRoutedCountGetter(() => 10);
+
+    const result = await indicator.isHealthy('kubemq');
+
+    expect(result.kubemq.status).toBe('degraded');
+    expect(result.kubemq.streamErrors).toEqual({ q1: 'broken' });
+    expect(result.kubemq.circuitBreakerState).toBe('half-open');
+    expect(result.kubemq.dlqRoutedCount).toBe(10);
+  });
+
+  it('circuitBreakerState getter returning undefined is still included', async () => {
+    indicator.setVerbose(true);
+    indicator.setCircuitBreakerStateGetter(() => undefined);
+
+    const result = await indicator.isHealthy('kubemq');
+
+    expect(result.kubemq.circuitBreakerState).toBeUndefined();
+    expect(result.kubemq).toHaveProperty('circuitBreakerState');
+  });
 });

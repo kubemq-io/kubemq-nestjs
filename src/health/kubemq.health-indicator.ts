@@ -13,6 +13,8 @@ export interface HealthIndicatorResult {
 export class KubeMQHealthIndicator {
   private subscriptionErrors: ReadonlyMap<string, string>;
   private verbose: boolean;
+  private getCircuitBreakerState?: () => string | undefined;
+  private getDlqRoutedCount?: () => number;
 
   constructor(
     private readonly client: KubeMQClient,
@@ -38,6 +40,14 @@ export class KubeMQHealthIndicator {
     this.verbose = verbose;
   }
 
+  setCircuitBreakerStateGetter(fn: () => string | undefined): void {
+    this.getCircuitBreakerState = fn;
+  }
+
+  setDlqRoutedCountGetter(fn: () => number): void {
+    this.getDlqRoutedCount = fn;
+  }
+
   async isHealthy(key: string): Promise<HealthIndicatorResult> {
     try {
       const start = Date.now();
@@ -50,6 +60,12 @@ export class KubeMQHealthIndicator {
             status: 'degraded',
             latencyMs,
             ...(this.verbose ? { streamErrors: Object.fromEntries(this.subscriptionErrors) } : {}),
+            ...(this.getCircuitBreakerState
+              ? { circuitBreakerState: this.getCircuitBreakerState() }
+              : {}),
+            ...(this.getDlqRoutedCount
+              ? { dlqRoutedCount: this.getDlqRoutedCount() }
+              : {}),
           },
         };
       }
@@ -63,6 +79,12 @@ export class KubeMQHealthIndicator {
             version: info.version,
             serverStartTime: info.serverStartTime,
             serverUpTime: info.serverUpTime,
+            ...(this.getCircuitBreakerState
+              ? { circuitBreakerState: this.getCircuitBreakerState() }
+              : {}),
+            ...(this.getDlqRoutedCount
+              ? { dlqRoutedCount: this.getDlqRoutedCount() }
+              : {}),
           },
         };
       }

@@ -70,11 +70,42 @@ export type {
   EventHandlerOptions,
   EventStoreHandlerOptions,
   QueueHandlerOptions,
+  KubeMQFeatureOptions,
+  KubeMQFeatureAsyncOptions,
+  KubeMQFeatureOptionsFactory,
+  CircuitBreakerOptions,
+  KubeMQServerEvents,
+  KubeMQClientEvents,
 } from './interfaces/index.js';
 export type {
   KubeMQHandlerMetadata,
   EventStoreStartFrom,
 } from './interfaces/handler-metadata.interface.js';
+
+// Codecs
+export { MessagePackSerializer, MessagePackDeserializer } from './serialization/msgpack.serializer.js';
+export { ProtobufSerializer, ProtobufDeserializer } from './serialization/protobuf.serializer.js';
+
+// Circuit Breaker
+export { CircuitBreakerOpenError } from './errors/circuit-breaker.error.js';
+
+// Backpressure
+export { BackpressureOverflowError } from './errors/backpressure-overflow.error.js';
+
+// DLQ
+export { DeadLetterError } from './errors/dlq.error.js';
+
+// Validation
+export { MessageValidationError } from './errors/validation.error.js';
+
+// Idempotency
+export { DuplicateMessageError } from './errors/idempotency.error.js';
+
+// Correlation
+export { CorrelationContext } from './correlation/correlation-context.js';
+
+// forFeature scoped client
+export { ScopedKubeMQClientProxy } from './client/scoped-kubemq-client.proxy.js';
 
 // Constants
 export {
@@ -85,5 +116,10 @@ export {
   TAG_ID,
   TAG_TYPE,
   TAG_CONTENT_TYPE,
+  TAG_CORRELATION_ID,
+  TAG_CAUSATION_ID,
+  TAG_IDEMPOTENCY_KEY,
+  TAG_TRACEPARENT,
+  TAG_TRACESTATE,
 } from './constants.js';
 export type { KubeMQPatternType } from './constants.js';

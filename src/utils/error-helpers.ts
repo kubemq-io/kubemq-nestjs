@@ -27,7 +27,7 @@ export function isModuleNotFoundError(e: unknown): boolean {
  */
 export function isConnectionError(err: unknown): boolean {
   if (err === null || typeof err !== 'object') return false;
-  const ctor = (err as object).constructor?.name ?? '';
+  const ctor = (err).constructor?.name ?? '';
   if (
     ctor === 'ConnectionError' ||
     ctor === 'TransientError' ||

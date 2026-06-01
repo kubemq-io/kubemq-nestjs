@@ -28,11 +28,22 @@ export class MockKubeMQClient extends ClientProxy {
   /** Recorded emit() calls: { pattern, data }[]. */
   readonly emitCalls: Array<{ pattern: string; data: unknown }> = [];
 
+  /** Recorded DLQ routing events. */
+  readonly dlqEvents: Array<{
+    sourceChannel: string;
+    dlqChannel: string;
+    messageId: string;
+    error: string;
+  }> = [];
+
   /** Pre-configured responses keyed by pattern. */
   private responses = new Map<string, unknown>();
 
   /** Pre-configured errors keyed by pattern. */
   private errors = new Map<string, Error>();
+
+  private _circuitBreakerState: 'closed' | 'open' | 'half-open' = 'closed';
+  private _correlationId?: string;
 
   /**
    * Set the response value for a given pattern.
@@ -48,6 +59,22 @@ export class MockKubeMQClient extends ClientProxy {
    */
   setError(pattern: string, error: Error): void {
     this.errors.set(pattern, error);
+  }
+
+  setCircuitBreakerState(state: 'closed' | 'open' | 'half-open'): void {
+    this._circuitBreakerState = state;
+  }
+
+  getCircuitBreakerState(): 'closed' | 'open' | 'half-open' {
+    return this._circuitBreakerState;
+  }
+
+  setCorrelationId(id: string): void {
+    this._correlationId = id;
+  }
+
+  getCorrelationId(): string | undefined {
+    return this._correlationId;
   }
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- required by abstract base class
@@ -91,7 +118,10 @@ export class MockKubeMQClient extends ClientProxy {
   reset(): void {
     this.sendCalls.length = 0;
     this.emitCalls.length = 0;
+    this.dlqEvents.length = 0;
     this.responses.clear();
     this.errors.clear();
+    this._circuitBreakerState = 'closed';
+    this._correlationId = undefined;
   }
 }

@@ -80,7 +80,7 @@ describe('KubeMQQueueBatchContext', () => {
     const msgs = [{ ack: vi.fn(), nack: vi.fn() }];
     const batch = new KubeMQQueueBatchContext(ctxs, msgs, false);
 
-    expect(() => batch.ackAll()).toThrow('manual ack mode');
+    expect(() => { batch.ackAll(); }).toThrow('manual ack mode');
   });
 
   it('nackAll() throws when not in manual ack mode', () => {
@@ -88,7 +88,7 @@ describe('KubeMQQueueBatchContext', () => {
     const msgs = [{ ack: vi.fn(), nack: vi.fn() }];
     const batch = new KubeMQQueueBatchContext(ctxs, msgs, false);
 
-    expect(() => batch.nackAll()).toThrow('manual ack mode');
+    expect(() => { batch.nackAll(); }).toThrow('manual ack mode');
   });
 });
 

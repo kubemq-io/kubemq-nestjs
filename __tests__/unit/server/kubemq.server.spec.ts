@@ -43,6 +43,7 @@ vi.mock('kubemq-js', () => ({
 }));
 
 import { KubeMQServer } from '../../../src/server/kubemq.server.js';
+import { CorrelationContext } from '../../../src/correlation/correlation-context.js';
 
 // Helper to access protected fields via type casting
 function getMessageHandlers(server: KubeMQServer): Map<string, any> {
@@ -1266,5 +1267,622 @@ describe('KubeMQServer', () => {
     });
     const timeoutMs = (fallbackServer as any).getHandlerTimeoutMs('query');
     expect(timeoutMs).toBe(15_000);
+  });
+
+  // --- Reconnect loop ---
+
+  it('listen() with waitForConnection=false starts reconnect loop on connection error', async () => {
+    const { KubeMQClient } = await import('kubemq-js');
+    (KubeMQClient.create as any).mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+    const reconnectServer = new KubeMQServer({
+      address: 'localhost:50000',
+      waitForConnection: false,
+    });
+
+    const startLoopSpy = vi.spyOn((reconnectServer as any).reconnect, 'startLoop');
+
+    const callback = vi.fn();
+    await reconnectServer.listen(callback);
+
+    expect(callback).toHaveBeenCalledOnce();
+    expect(startLoopSpy).toHaveBeenCalledOnce();
+
+    await reconnectServer.close();
+  });
+
+  it('listen() with waitForConnection=false still throws for non-connection errors', async () => {
+    const { KubeMQClient } = await import('kubemq-js');
+    (KubeMQClient.create as any).mockRejectedValueOnce(new Error('Invalid configuration'));
+
+    const nonConnServer = new KubeMQServer({
+      address: 'localhost:50000',
+      waitForConnection: false,
+    });
+
+    await expect(nonConnServer.listen(vi.fn())).rejects.toThrow('Invalid configuration');
+  });
+
+  // --- on() forwarding ---
+
+  it('on() forwards to client.on() when client is already connected', async () => {
+    await server.listen(vi.fn());
+    mockClient.on.mockClear();
+
+    const cb = vi.fn();
+    server.on('customEvent', cb);
+
+    expect(mockClient.on).toHaveBeenCalledWith('customEvent', cb);
+    expect((server as any).domainListeners.get('customEvent')!.has(cb)).toBe(true);
+  });
+
+  // --- Wildcard patterns ---
+
+  it('wildcard * pattern on event handler binds successfully', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'wildcard-star',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('events.*', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'event' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    expect(mockClient.subscribeToEvents).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'events.*' }),
+      undefined,
+    );
+  });
+
+  it('wildcard > pattern on event handler binds successfully', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'wildcard-gt',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('events.>', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'event' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    expect(mockClient.subscribeToEvents).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'events.>' }),
+      undefined,
+    );
+  });
+
+  it('wildcard * on command handler throws ValidationError', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'wildcard-cmd',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('commands.*', Object.assign(
+      async () => 'ok',
+      { isEventHandler: false, extras: { type: 'command' } },
+    ));
+
+    await expect(handlerServer.listen(vi.fn())).rejects.toThrow(
+      'Wildcard subscriptions are only supported for @EventHandler',
+    );
+  });
+
+  it('wildcard > on queue handler throws ValidationError', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'wildcard-queue',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('queues.>', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'queue' } },
+    ));
+
+    await expect(handlerServer.listen(vi.fn())).rejects.toThrow(
+      'Wildcard subscriptions are only supported for @EventHandler',
+    );
+  });
+
+  // --- Validation failure paths ---
+
+  it('validation failure on command sends error response', async () => {
+    class FakeDto {}
+
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'validate-cmd',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('cmd-validate', Object.assign(
+      async () => 'ok',
+      { isEventHandler: false, extras: { type: 'command', validate: FakeDto } },
+    ));
+
+    vi.spyOn((handlerServer as any).messageValidator, 'validate').mockResolvedValue({
+      valid: false,
+      error: new Error('Validation failed: field x is required'),
+    });
+
+    await handlerServer.listen(vi.fn());
+
+    const subCall = mockClient.subscribeToCommands.mock.calls.find(
+      (c: any[]) => c[0].channel === 'cmd-validate',
+    );
+    const onCommand = subCall![0].onCommand;
+
+    await onCommand({
+      channel: 'cmd-validate',
+      id: 'vc-1',
+      timestamp: new Date(),
+      tags: {},
+      metadata: '',
+      fromClientId: 'sender',
+      replyChannel: 'reply',
+      body: new TextEncoder().encode('{}'),
+    });
+
+    expect(mockClient.sendCommandResponse).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'vc-1',
+        executed: false,
+        error: 'Internal handler error',
+      }),
+    );
+  });
+
+  it('validation failure on queue without DLQ logs warning and acks', async () => {
+    class FakeDto {}
+
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'validate-queue-no-dlq',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('queue-validate', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'queue', validate: FakeDto } },
+    ));
+
+    vi.spyOn((handlerServer as any).messageValidator, 'validate').mockResolvedValue({
+      valid: false,
+      error: new Error('Validation failed'),
+    });
+
+    mockQueueStreamHandle.onMessages.mockClear();
+    await handlerServer.listen(vi.fn());
+
+    const onMessagesCall = mockQueueStreamHandle.onMessages.mock.calls[
+      mockQueueStreamHandle.onMessages.mock.calls.length - 1
+    ];
+    const onMessages = onMessagesCall[0];
+
+    const mockMsg = {
+      channel: 'queue-validate', id: 'qv-1', timestamp: new Date(), tags: {},
+      metadata: '', body: new TextEncoder().encode('{}'),
+      sequence: 1, receiveCount: 1, isReRouted: false, reRouteFromQueue: '',
+      ack: vi.fn(), nack: vi.fn(),
+    };
+
+    await onMessages([mockMsg]);
+
+    expect(mockMsg.ack).toHaveBeenCalledOnce();
+    expect(mockMsg.nack).not.toHaveBeenCalled();
+  });
+
+  it('validation failure on queue with DLQ routes to dead letter and acks', async () => {
+    class FakeDto {}
+
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'validate-queue-dlq',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('queue-validate-dlq', Object.assign(
+      async () => {},
+      {
+        isEventHandler: true,
+        extras: { type: 'queue', validate: FakeDto, deadLetterChannel: 'dlq.validate' },
+      },
+    ));
+
+    vi.spyOn((handlerServer as any).messageValidator, 'validate').mockResolvedValue({
+      valid: false,
+      error: new Error('Validation failed'),
+    });
+
+    mockQueueStreamHandle.onMessages.mockClear();
+    mockClient.sendQueueMessage.mockClear();
+    await handlerServer.listen(vi.fn());
+
+    const onMessagesCall = mockQueueStreamHandle.onMessages.mock.calls[
+      mockQueueStreamHandle.onMessages.mock.calls.length - 1
+    ];
+    const onMessages = onMessagesCall[0];
+
+    const mockMsg = {
+      channel: 'queue-validate-dlq', id: 'qvd-1', timestamp: new Date(), tags: {},
+      metadata: '', body: new TextEncoder().encode('{}'),
+      sequence: 1, receiveCount: 1, isReRouted: false, reRouteFromQueue: '',
+      ack: vi.fn(), nack: vi.fn(),
+    };
+
+    await onMessages([mockMsg]);
+
+    expect(mockMsg.ack).toHaveBeenCalledOnce();
+    expect(mockMsg.nack).not.toHaveBeenCalled();
+    expect(mockClient.sendQueueMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'dlq.validate' }),
+    );
+  });
+
+  // --- Idempotency ---
+
+  it('idempotency cache hit skips duplicate queue message and acks', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'idempotency-test',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    const handlerFn = vi.fn(async () => {});
+    handlers.set('idem-ch', Object.assign(handlerFn, {
+      isEventHandler: true,
+      extras: { type: 'queue', idempotency: { ttlSeconds: 300 } },
+    }));
+
+    mockQueueStreamHandle.onMessages.mockClear();
+    await handlerServer.listen(vi.fn());
+
+    const onMessagesCall = mockQueueStreamHandle.onMessages.mock.calls[
+      mockQueueStreamHandle.onMessages.mock.calls.length - 1
+    ];
+    const onMessages = onMessagesCall[0];
+
+    const msg1 = {
+      channel: 'idem-ch', id: 'idem-1', timestamp: new Date(),
+      tags: { 'x-idempotency-key': 'unique-key-1' },
+      metadata: '', body: new TextEncoder().encode('{}'),
+      sequence: 1, receiveCount: 1, isReRouted: false, reRouteFromQueue: '',
+      ack: vi.fn(), nack: vi.fn(),
+    };
+
+    await onMessages([msg1]);
+    expect(handlerFn).toHaveBeenCalledOnce();
+    expect(msg1.ack).toHaveBeenCalledOnce();
+
+    const msg2 = {
+      channel: 'idem-ch', id: 'idem-2', timestamp: new Date(),
+      tags: { 'x-idempotency-key': 'unique-key-1' },
+      metadata: '', body: new TextEncoder().encode('{}'),
+      sequence: 2, receiveCount: 1, isReRouted: false, reRouteFromQueue: '',
+      ack: vi.fn(), nack: vi.fn(),
+    };
+
+    await onMessages([msg2]);
+    expect(handlerFn).toHaveBeenCalledOnce();
+    expect(msg2.ack).toHaveBeenCalledOnce();
+  });
+
+  // --- DLQ retry exhaustion ---
+
+  it('event handler exhausts retries and routes to DLQ', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'dlq-exhaust',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    const handlerFn = vi.fn(async () => { throw new Error('always fails'); });
+    handlers.set('evt-dlq', Object.assign(handlerFn, {
+      isEventHandler: true,
+      extras: { type: 'event', deadLetterChannel: 'dlq.evt', maxRetries: 1 },
+    }));
+
+    mockClient.sendQueueMessage.mockClear();
+    await handlerServer.listen(vi.fn());
+
+    const subCall = mockClient.subscribeToEvents.mock.calls.find(
+      (c: any[]) => c[0].channel === 'evt-dlq',
+    );
+    const onEvent = subCall![0].onEvent;
+
+    await onEvent({
+      channel: 'evt-dlq', id: 'evt-dlq-1', timestamp: new Date(), tags: {},
+      metadata: '', body: new TextEncoder().encode('{}'),
+    });
+
+    expect(handlerFn).toHaveBeenCalledTimes(2);
+    expect(mockClient.sendQueueMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: 'dlq.evt' }),
+    );
+  });
+
+  // --- Backpressure semaphore ---
+
+  it('queue handler with concurrency uses backpressure semaphore', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'semaphore-test',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('sem-ch', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'queue', concurrency: 2 } },
+    ));
+
+    mockQueueStreamHandle.onMessages.mockClear();
+    await handlerServer.listen(vi.fn());
+
+    const semaphores = (handlerServer as any).semaphores as Map<string, any>;
+    expect(semaphores.has('sem-ch')).toBe(true);
+
+    const sem = semaphores.get('sem-ch')!;
+    const acquireSpy = vi.spyOn(sem, 'acquire');
+    const releaseSpy = vi.spyOn(sem, 'release');
+
+    const onMessagesCall = mockQueueStreamHandle.onMessages.mock.calls[
+      mockQueueStreamHandle.onMessages.mock.calls.length - 1
+    ];
+    const onMessages = onMessagesCall[0];
+
+    const mockMsg = {
+      channel: 'sem-ch', id: 'sem-1', timestamp: new Date(), tags: {},
+      metadata: '', body: new TextEncoder().encode('{}'),
+      sequence: 1, receiveCount: 1, isReRouted: false, reRouteFromQueue: '',
+      ack: vi.fn(), nack: vi.fn(),
+    };
+
+    await onMessages([mockMsg]);
+
+    expect(acquireSpy).toHaveBeenCalledOnce();
+    expect(releaseSpy).toHaveBeenCalledOnce();
+  });
+
+  // --- Correlation context ---
+
+  it('handler runs inside CorrelationContext with correct values', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'correlation-test',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    let capturedCorrelation: { correlationId: string; causationId: string } | undefined;
+    handlers.set('corr-ch', Object.assign(
+      async () => {
+        capturedCorrelation = CorrelationContext.get();
+        return 'ok';
+      },
+      { isEventHandler: false, extras: { type: 'command' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    const subCall = mockClient.subscribeToCommands.mock.calls.find(
+      (c: any[]) => c[0].channel === 'corr-ch',
+    );
+    const onCommand = subCall![0].onCommand;
+
+    await onCommand({
+      channel: 'corr-ch', id: 'corr-1', timestamp: new Date(),
+      tags: { 'x-correlation-id': 'my-corr-id' },
+      metadata: '', fromClientId: 'sender', replyChannel: 'reply',
+      body: new TextEncoder().encode('{}'),
+    });
+
+    expect(capturedCorrelation).toBeDefined();
+    expect(capturedCorrelation!.correlationId).toBe('my-corr-id');
+    expect(capturedCorrelation!.causationId).toBe('corr-1');
+  });
+
+  // --- Queue reRouted detection ---
+
+  it('queue message with reRouted=true emits deadLetter domain event', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'rerouted-test',
+    });
+
+    const deadLetterCallback = vi.fn();
+    handlerServer.on('deadLetter', deadLetterCallback);
+
+    const handlers = getMessageHandlers(handlerServer);
+    handlers.set('rerouted-ch', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'queue', deadLetterChannel: 'dlq.rerouted' } },
+    ));
+
+    mockQueueStreamHandle.onMessages.mockClear();
+    await handlerServer.listen(vi.fn());
+
+    const onMessagesCall = mockQueueStreamHandle.onMessages.mock.calls[
+      mockQueueStreamHandle.onMessages.mock.calls.length - 1
+    ];
+    const onMessages = onMessagesCall[0];
+
+    const mockMsg = {
+      channel: 'rerouted-ch', id: 'rr-1', timestamp: new Date(), tags: {},
+      metadata: '', body: new TextEncoder().encode('{}'),
+      sequence: 1, receiveCount: 3, isReRouted: true, reRouteFromQueue: 'original-queue',
+      ack: vi.fn(), nack: vi.fn(),
+    };
+
+    await onMessages([mockMsg]);
+
+    expect(deadLetterCallback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: 'rerouted-ch',
+        dlqChannel: 'dlq.rerouted',
+        messageId: 'rr-1',
+        error: '(broker-routed to DLQ)',
+        retryCount: 3,
+      }),
+    );
+  });
+
+  // --- getDlqRoutedCount ---
+
+  it('getDlqRoutedCount() returns 0 before listen', () => {
+    const freshServer = new KubeMQServer({ address: 'localhost:50000' });
+    expect(freshServer.getDlqRoutedCount()).toBe(0);
+  });
+
+  it('getDlqRoutedCount() returns count after DLQ routing', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'dlq-count',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('evt-count', Object.assign(
+      vi.fn(async () => { throw new Error('fail'); }),
+      { isEventHandler: true, extras: { type: 'event', deadLetterChannel: 'dlq.count', maxRetries: 0 } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    const subCall = mockClient.subscribeToEvents.mock.calls.find(
+      (c: any[]) => c[0].channel === 'evt-count',
+    );
+    const onEvent = subCall![0].onEvent;
+
+    mockClient.sendQueueMessage.mockClear();
+    await onEvent({
+      channel: 'evt-count', id: 'dc-1', timestamp: new Date(), tags: {},
+      metadata: '', body: new TextEncoder().encode('{}'),
+    });
+
+    expect(handlerServer.getDlqRoutedCount()).toBe(1);
+  });
+
+  // --- Subscription error callbacks ---
+
+  it('command subscription onError records error in subscriptionErrors', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'cmd-sub-err',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('cmd-err-ch', Object.assign(
+      async () => 'ok',
+      { isEventHandler: false, extras: { type: 'command' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    const subCall = mockClient.subscribeToCommands.mock.calls.find(
+      (c: any[]) => c[0].channel === 'cmd-err-ch',
+    );
+    const onError = subCall![0].onError;
+
+    onError(new Error('command sub error'));
+
+    expect(handlerServer.getSubscriptionErrors().get('cmd-err-ch')).toBe('command sub error');
+  });
+
+  it('query subscription onError records error in subscriptionErrors', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'query-sub-err',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('query-err-ch', Object.assign(
+      async () => 'ok',
+      { isEventHandler: false, extras: { type: 'query' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    const subCall = mockClient.subscribeToQueries.mock.calls.find(
+      (c: any[]) => c[0].channel === 'query-err-ch',
+    );
+    const onError = subCall![0].onError;
+
+    onError(new Error('query sub error'));
+
+    expect(handlerServer.getSubscriptionErrors().get('query-err-ch')).toBe('query sub error');
+  });
+
+  it('event subscription onError records error in subscriptionErrors', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'evt-sub-err',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('evt-err-ch', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'event' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    const subCall = mockClient.subscribeToEvents.mock.calls.find(
+      (c: any[]) => c[0].channel === 'evt-err-ch',
+    );
+    const onError = subCall![0].onError;
+
+    onError(new Error('event sub error'));
+
+    expect(handlerServer.getSubscriptionErrors().get('evt-err-ch')).toBe('event sub error');
+  });
+
+  // --- close() error swallow ---
+
+  it('close() swallows subscription cancel errors', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'close-cancel-err',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('close-ch', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'event' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    mockSubscription.cancel.mockImplementation(() => { throw new Error('cancel failed'); });
+
+    await expect(handlerServer.close()).resolves.toBeUndefined();
+
+    mockSubscription.cancel.mockReset();
+  });
+
+  it('close() swallows queue stream close errors', async () => {
+    const handlerServer = new KubeMQServer({
+      address: 'localhost:50000',
+      clientId: 'close-stream-err',
+    });
+    const handlers = getMessageHandlers(handlerServer);
+
+    handlers.set('close-q-ch', Object.assign(
+      async () => {},
+      { isEventHandler: true, extras: { type: 'queue' } },
+    ));
+
+    await handlerServer.listen(vi.fn());
+
+    mockQueueStreamHandle.close.mockImplementation(() => { throw new Error('close failed'); });
+
+    await expect(handlerServer.close()).resolves.toBeUndefined();
+
+    mockQueueStreamHandle.close.mockReset();
   });
 });

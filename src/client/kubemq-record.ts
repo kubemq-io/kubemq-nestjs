@@ -1,4 +1,5 @@
 import type { KubeMQPatternType } from '../constants.js';
+import { TAG_CORRELATION_ID, TAG_IDEMPOTENCY_KEY } from '../constants.js';
 
 export const KUBEMQ_RECORD_SYMBOL = Symbol.for('kubemq.record');
 
@@ -75,6 +76,27 @@ export class KubeMQRecord<T = unknown> {
       next[k] = v;
     }
     this._tags = next;
+    return this;
+  }
+
+  /** Set delay in seconds for queue messages (maps to QueueMessagePolicy.DelaySeconds). */
+  withDelay(seconds: number): this {
+    this._metadata = {
+      ...this._metadata,
+      policy: { ...(this._metadata.policy as Record<string, unknown> ?? {}), delaySeconds: seconds },
+    };
+    return this;
+  }
+
+  /** Set an idempotency key tag for deduplication. */
+  withIdempotencyKey(key: string): this {
+    this._tags[TAG_IDEMPOTENCY_KEY] = key;
+    return this;
+  }
+
+  /** Set a correlation ID tag (overrides auto-propagation). */
+  withCorrelationId(id: string): this {
+    this._tags[TAG_CORRELATION_ID] = id;
     return this;
   }
 

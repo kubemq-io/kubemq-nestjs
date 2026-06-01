@@ -20,6 +20,7 @@ import {
   PartialFailureError,
 } from 'kubemq-js';
 import { KubeMQRpcException } from './kubemq-rpc.exception.js';
+import { CircuitBreakerOpenError } from './circuit-breaker.error.js';
 
 const SANITIZED_CLIENT_MESSAGE = 'Transport operation failed';
 
@@ -28,6 +29,16 @@ export function mapErrorToRpcException(
   channel?: string,
   verbose = false,
 ): KubeMQRpcException {
+  if (err instanceof CircuitBreakerOpenError) {
+    return new KubeMQRpcException({
+      statusCode: 503,
+      message: verbose ? err.message : SANITIZED_CLIENT_MESSAGE,
+      kubemqCode: 'CIRCUIT_BREAKER_OPEN',
+      kubemqCategory: 'Transient',
+      channel,
+    });
+  }
+
   if (!(err instanceof KubeMQError)) {
     return new KubeMQRpcException({
       statusCode: 500,

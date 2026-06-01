@@ -29,4 +29,13 @@ export interface KubeMQHandlerMetadata {
   readonly maxMessages?: number;
   readonly waitTimeoutSeconds?: number;
   readonly batch?: boolean;
+  readonly deadLetterChannel?: string;
+  readonly maxRetries?: number;
+  readonly concurrency?: number;
+  readonly maxQueueDepth?: number;
+  readonly validate?: new (...args: any[]) => any;
+  readonly idempotency?: {
+    ttlSeconds?: number;
+    maxCacheSize?: number;
+  };
 }

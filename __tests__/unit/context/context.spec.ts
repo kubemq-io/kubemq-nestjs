@@ -162,7 +162,7 @@ describe('Context Hierarchy', () => {
       patternType: 'queue', sequence: 1, receiveCount: 1, isReRouted: false,
       _rawMessage: null,
     }]);
-    expect(() => ctx.ack()).toThrow('manual ack mode');
+    expect(() => { ctx.ack(); }).toThrow('manual ack mode');
   });
 
   it('nack() throws when _rawMessage is null (auto-ack mode)', () => {
@@ -171,7 +171,7 @@ describe('Context Hierarchy', () => {
       patternType: 'queue', sequence: 1, receiveCount: 1, isReRouted: false,
       _rawMessage: null,
     }]);
-    expect(() => ctx.nack()).toThrow('manual ack mode');
+    expect(() => { ctx.nack(); }).toThrow('manual ack mode');
   });
 
   it('reQueue() throws when _rawMessage is null (auto-ack mode)', () => {
@@ -180,7 +180,63 @@ describe('Context Hierarchy', () => {
       patternType: 'queue', sequence: 1, receiveCount: 1, isReRouted: false,
       _rawMessage: null,
     }]);
-    expect(() => ctx.reQueue('dlq')).toThrow('manual ack mode');
+    expect(() => { ctx.reQueue('dlq'); }).toThrow('manual ack mode');
+  });
+
+  it('getCorrelationId() returns tag value when present', () => {
+    const ctx = new KubeMQContext([
+      {
+        channel: 'ch',
+        id: 'id-1',
+        timestamp: new Date(),
+        tags: { 'x-correlation-id': 'corr-abc' },
+        metadata: '',
+        patternType: 'event',
+      },
+    ]);
+    expect(ctx.getCorrelationId()).toBe('corr-abc');
+  });
+
+  it('getCorrelationId() returns undefined when tag is absent', () => {
+    const ctx = new KubeMQContext([
+      {
+        channel: 'ch',
+        id: 'id-2',
+        timestamp: new Date(),
+        tags: {},
+        metadata: '',
+        patternType: 'event',
+      },
+    ]);
+    expect(ctx.getCorrelationId()).toBeUndefined();
+  });
+
+  it('getCausationId() returns tag value when present', () => {
+    const ctx = new KubeMQContext([
+      {
+        channel: 'ch',
+        id: 'id-3',
+        timestamp: new Date(),
+        tags: { 'x-causation-id': 'cause-xyz' },
+        metadata: '',
+        patternType: 'event',
+      },
+    ]);
+    expect(ctx.getCausationId()).toBe('cause-xyz');
+  });
+
+  it('getCausationId() returns undefined when tag is absent', () => {
+    const ctx = new KubeMQContext([
+      {
+        channel: 'ch',
+        id: 'id-4',
+        timestamp: new Date(),
+        tags: {},
+        metadata: '',
+        patternType: 'event',
+      },
+    ]);
+    expect(ctx.getCausationId()).toBeUndefined();
   });
 
   // Verify KubeMQCommandContext and KubeMQQueryContext are re-exported from KubeMQRequestContext

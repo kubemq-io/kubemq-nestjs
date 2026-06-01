@@ -40,3 +40,25 @@ export interface KubeMQTestOptions {
   name?: string | symbol;
   isGlobal?: boolean;
 }
+
+export interface KubeMQFeatureOptions {
+  /** Injection token for the scoped client. */
+  name: string | symbol;
+  /** Channel prefix prepended to all send/emit patterns. */
+  channelPrefix?: string;
+}
+
+export interface KubeMQFeatureAsyncOptions {
+  /** Injection token for the scoped client. */
+  name: string | symbol;
+  imports?: Array<Type<unknown> | DynamicModule | Promise<DynamicModule> | ForwardReference>;
+  /** Returns only feature-scoped options — connection/client config comes from forRoot(). */
+  useFactory?: (...args: any[]) => KubeMQFeatureOptions | Promise<KubeMQFeatureOptions>;
+  useClass?: Type<KubeMQFeatureOptionsFactory>;
+  useExisting?: Type<KubeMQFeatureOptionsFactory>;
+  inject?: InjectionToken[];
+}
+
+export interface KubeMQFeatureOptionsFactory {
+  createKubeMQFeatureOptions(): KubeMQFeatureOptions | Promise<KubeMQFeatureOptions>;
+}
