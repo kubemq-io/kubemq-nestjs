@@ -22,3 +22,8 @@ lerna-debug.log*
 # temp directory
 .temp
 .tmp
+
+# IDE, coverage, and dependencies
+.idea/
+coverage/
+node_modules/
