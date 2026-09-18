@@ -1300,7 +1300,7 @@ Custom serializer and deserializer implementations.
 
 | Problem | Solution |
 |---------|----------|
-| **Connection refused** (`ECONNREFUSED`) | Verify KubeMQ server is running on the configured address. Start a local broker with `docker run -p 50000:50000 kubemq/kubemq-community`. |
+| **Connection refused** (`ECONNREFUSED`) | Verify KubeMQ server is running on the configured address. Start a local broker with `docker run -p 50000:50000 europe-docker.pkg.dev/kubemq/images/kubemq-next:latest`. |
 | **Connection timeout** | Check network connectivity and firewall rules. Increase `connectionTimeoutSeconds` if the broker is remote. |
 | **Decorator not firing** | Ensure the handler class is registered as a provider in a module that imports `KubeMQModule`. The handler must be a NestJS-managed provider, not a standalone class. |
 | **`Cannot find module '@kubemq/nestjs-transport'`** | Run `npm install @kubemq/nestjs-transport kubemq-js`. Verify `node_modules/@kubemq/nestjs-transport` exists. |
